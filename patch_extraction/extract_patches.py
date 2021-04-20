@@ -8,29 +8,32 @@ import os
 import cv2
 import numpy as np
 import pandas as pd
-
+import PIL
 from PIL import Image
-from openslide import OpenSlide, OpenSlideUnsupportedFormatError
-
+import openslide
+from openslide import OpenSlide, ImageSlide, OpenSlideUnsupportedFormatError
+#from utils import _load_image_morethan_2_29 # to avoid integer overflow error
 import gc
-import pdb
-
+import sys
+import large_image
 '''
-    Read global variables / constants from config.txt file.
+    Global variables / constants
 '''
-f = open('config.txt','r')
-for line in f:
-    line = line.strip('\n')                             
-    var_name,value = line.split('=')                          # Split value and variable by =
-    var_name = var_name.strip()                               # strip whitespace if present
-    value = value.strip()
-    if '.' in value:                                          # check if value is float
-        exec('%s = %f' %( var_name, float(value) ) )
-    else:
-        exec('%s = %d' %( var_name, int(value) ) )
+PATCH_SIZE = 512
+CHANNEL = 3
+CLASS_NUM = 2
 
+DROPOUT = 0.5
+
+THRESH = 90
+
+PIXEL_WHITE = 255
+PIXEL_TH = 200
+PIXEL_BLACK = 0
+
+level = 3
 mag_factor = pow(2, level)
-verboseprint = print if verbose else lambda *a, **k: None    # As per https://stackoverflow.com/a/5980173
+Image.MAX_IMAGE_PIXELS = None
 '''
     !!!! It should be noticed with great caution that:
 
@@ -47,10 +50,60 @@ verboseprint = print if verbose else lambda *a, **k: None    # As per https://st
     But the read_region() method of OpenSlide object performs in level0 scale, so 
     transformation is needed when invoking read_region().
 '''
+def _load_image_morethan_2_29(buf, size):
+    '''buf must be a buffer.'''
 
+    # Load entire buffer at once if possible
+    MAX_PIXELS_PER_LOAD = (1 << 29) - 1
+    # Otherwise, use chunks smaller than the maximum to reduce memory
+    # requirements
+    PIXELS_PER_LOAD = 1 << 26
+
+    def do_load(buf, size):
+        '''buf can be a string, but should be a ctypes buffer to avoid an
+        extra copy in the caller.'''
+        # First reorder the bytes in a pixel from native-endian aRGB to
+        # big-endian RGBa to work around limitations in RGBa loader
+        rawmode = (sys.byteorder == 'little') and 'BGRA' or 'ARGB'
+        buf = PIL.Image.frombuffer('RGBA', size, buf, 'raw', rawmode, 0, 1)
+        # Image.tobytes() is named tostring() in Pillow 1.x and PIL
+        buf = (getattr(buf, 'tobytes', None) or buf.tostring)()
+        # Now load the image as RGBA, undoing premultiplication
+        return PIL.Image.frombuffer('RGBA', size, buf, 'raw', 'RGBa', 0, 1)
+
+    # Fast path for small buffers
+    w, h = size
+    if w * h <= MAX_PIXELS_PER_LOAD:
+        return do_load(buf, size)
+
+    # Load in chunks to avoid OverflowError in PIL.Image.frombuffer()
+    # https://github.com/python-pillow/Pillow/issues/1475
+    if w > PIXELS_PER_LOAD:
+        # We could support this, but it seems like overkill
+        raise ValueError('Width %d is too large (maximum %d)' %
+                         (w, PIXELS_PER_LOAD))
+    rows_per_load = PIXELS_PER_LOAD // w
+    img = PIL.Image.new('RGBA', (w, h))
+    for y in range(0, h, rows_per_load):
+        rows = min(h - y, rows_per_load)
+        if sys.version[0] == '2':
+            chunk = buffer(buf, 4 * y * w, 4 * rows * w)
+        else:
+            # PIL.Image.frombuffer() won't take a memoryview or
+            # bytearray, so we can't avoid copying
+            chunk = memoryview(buf)[y * w:(y + rows) * w].tobytes()
+        img.paste(do_load(chunk, (w, rows)), (0, y))
+    return img
 '''
     Load slides into memory.
 '''
+
+def read_tf_largeImage(tif_file_path, mag):
+    wsi_image = large_image.getTileSource(tif_file_path)
+    rgba_image, _ = wsi_image.getRegion(scale=dict(magnification=mag),format=large_image.tilesource.TILE_FORMAT_NUMPY)
+    slide_w, slide_h = rgba_image.shape[1], rgba_image.shape[0] 
+    return rgba_image, (slide_w, slide_h)
+
 def read_wsi(tif_file_path, level):
     
     '''
@@ -63,6 +116,8 @@ def read_wsi(tif_file_path, level):
     time_s = time.time()
     
     try:
+        # import pdb
+        # pdb.set_trace()
         wsi_image = OpenSlide(tif_file_path)
         slide_w_, slide_h_ = wsi_image.level_dimensions[level]
         
@@ -78,9 +133,11 @@ def read_wsi(tif_file_path, level):
 
         # Here we load the whole image from (0, 0), so transformation of coordinates 
         # is not skipped.
-
+        # openslide.lowlevel._load_image = _load_image_morethan_2_29
+        # rgba_image_pil = Image.open(tif_file_path)
+        # (slide_w_, slide_h_) = rgba_image_pil.size
         rgba_image_pil = wsi_image.read_region((0, 0), level, (slide_w_, slide_h_))
-        verboseprint("width, height:", rgba_image_pil.size)
+        # print("width, height:", rgba_image_pil.size)
 
         '''
             !!! It should be noted that:
@@ -95,17 +152,17 @@ def read_wsi(tif_file_path, level):
             The A channel is unnecessary for now and could be dropped.
         '''
         rgba_image = np.asarray(rgba_image_pil)
-        verboseprint("transformed:", rgba_image.shape)
+        print("transformed:", rgba_image.shape)
         
     except OpenSlideUnsupportedFormatError:
-        print('Exception: OpenSlideUnsupportedFormatError')
+        # print('Exception: OpenSlideUnsupportedFormatError')
         return None
 
     time_e = time.time()
     
-    verboseprint("Time spent on loading", tif_file_path, ": ", (time_e - time_s))
+    # print("Time spent on loading", tif_file_path, ": ", (time_e - time_s))
     
-    return wsi_image, rgba_image, (slide_w_, slide_h_)
+    return rgba_image, (slide_w_, slide_h_)
 
 '''
     Convert RGBA to RGB, HSV and GRAY.
@@ -123,7 +180,8 @@ def construct_colored_wsi(rgba_):
     r_, g_, b_, a_ = cv2.split(rgba_)
     
     wsi_rgb_ = cv2.merge((r_, g_, b_))
-    
+    # wsi_rgb_ = rgba_
+
     wsi_gray_ = cv2.cvtColor(wsi_rgb_,cv2.COLOR_RGB2GRAY)
     wsi_hsv_ = cv2.cvtColor(wsi_rgb_, cv2.COLOR_RGB2HSV)
     
@@ -147,12 +205,13 @@ def get_contours(cont_img, rgb_image_shape):
         !!! It should be noticed that the shape of mask array is: (HEIGHT, WIDTH, CHANNEL).
     '''
     
-    verboseprint('contour image: ',cont_img.shape)
-    
-    contour_coords = []
-    contours, hiers = cv2.findContours(cont_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2:]
+    # print('contour image: ',cont_img.shape)
 
-    # print(contours)
+    contour_coords = []
+    contours, _ = cv2.findContours(cont_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2:]
+    # _, contours, _ = cv2.findContours(cont_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+#    print(contours)
     boundingBoxes = [cv2.boundingRect(c) for c in contours]
 
     for contour in contours:
@@ -160,7 +219,7 @@ def get_contours(cont_img, rgb_image_shape):
         
     mask = np.zeros(rgb_image_shape, np.uint8)
     
-    verboseprint('mask shape', mask.shape)
+    # print('mask shape', mask.shape)
     cv2.drawContours(mask, contours, -1, \
                     (PIXEL_WHITE, PIXEL_WHITE, PIXEL_WHITE),thickness=-1)
     
@@ -193,9 +252,8 @@ def segmentation_hsv(wsi_hsv_, wsi_rgb_):
 
         The only difference between $contours and $contour_coords is in shape.
     '''
-    verboseprint("HSV segmentation: ")
+    # print("HSV segmentation: ")
     contour_coord = []
-    
     '''
         Here we could tune for better results.
         Currently 20 and 200 are lower and upper threshold for H, S, V values, respectively. 
@@ -209,30 +267,30 @@ def segmentation_hsv(wsi_hsv_, wsi_rgb_):
     # HSV image threshold
     thresh = cv2.inRange(wsi_hsv_, lower_, upper_)
     
-    try:
-        verboseprint("thresh shape:", thresh.shape)
-    except:
-        verboseprint("thresh shape:", thresh.size)
-    else:
-        pass
+    # try:
+    #     # print("thresh shape:", thresh.shape)
+    # except:
+    #     # print("thresh shape:", thresh.size)
+    # else:
+    #     pass
     
     '''
         Closing
     '''
-    verboseprint("Closing step: ")
+    # print("Closing step: ")
     close_kernel = np.ones((15, 15), dtype=np.uint8) 
     image_close = cv2.morphologyEx(np.array(thresh),cv2.MORPH_CLOSE, close_kernel)
-    verboseprint("image_close size", image_close.shape)
+    # print("image_close size", image_close.shape)
 
     '''
         Openning
     ''' 
-    verboseprint("Openning step: ")
+    # print("Openning step: ")
     open_kernel = np.ones((5, 5), dtype=np.uint8)
     image_open = cv2.morphologyEx(image_close, cv2.MORPH_OPEN, open_kernel)
-    verboseprint("image_open size", image_open.size)
+    # print("image_open size", image_open.size)
 
-    verboseprint("Getting Contour: ")
+    # print("Getting Contour: ")
     bounding_boxes, contour_coords, contours, mask \
     = get_contours(np.array(image_open), wsi_rgb_.shape)
       
@@ -242,7 +300,7 @@ def segmentation_hsv(wsi_hsv_, wsi_rgb_):
 '''
     Extract Valid patches.
 '''
-def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE):
+def construct_bags(wsi_rgb, contours, mask, PATCH_SIZE):#, caseName):
     
     '''
     Args:
@@ -255,7 +313,9 @@ def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE)
     '''
 
     patches = []
+    discardedPatches = []
     patches_coords = []
+    whitePatches_coords = []
 
     start = time.time()
     
@@ -274,7 +334,7 @@ def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE)
     for i, box_ in enumerate(contours_):
 
         box_ = cv2.boundingRect(np.squeeze(box_))
-        verboseprint('region', i)
+        # print('region', i)
         
         '''
 
@@ -296,10 +356,10 @@ def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE)
             step size could be tuned for better results.
         '''
 
-        X = np.arange(b_x_start, b_x_end, step=PATCH_SIZE // 2)
-        Y = np.arange(b_y_start, b_y_end, step=PATCH_SIZE // 2)        
+        X = np.arange(b_x_start, b_x_end, step=PATCH_SIZE)#PATCH_SIZE // 2)
+        Y = np.arange(b_y_start, b_y_end, step=PATCH_SIZE)#PATCH_SIZE // 2)        
         
-        verboseprint('ROI length:', len(X), len(Y))
+        # print('ROI length:', len(X), len(Y))
         
         for h_pos, y_height_ in enumerate(Y):
         
@@ -307,30 +367,30 @@ def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE)
 
                 # Read again from WSI object wastes tooooo much time.
                 # patch_img = wsi_.read_region((x_width_, y_height_), level, (PATCH_SIZE, PATCH_SIZE))
-                
+
                 '''
                     !!! Take care of difference in shapes
                     Here, the shape of wsi_rgb is (HEIGHT, WIDTH, CHANNEL)
                     the shape of mask is (HEIGHT, WIDTH, CHANNEL)
                 '''
                 patch_arr = wsi_rgb[y_height_: y_height_ + PATCH_SIZE,\
-                                    x_width_:x_width_ + PATCH_SIZE,:]            
-                verboseprint("read_region (scaled coordinates): ", x_width_, y_height_)
+                                    x_width_:x_width_ + PATCH_SIZE,:]
+                # print("read_region (scaled coordinates): ", x_width_, y_height_)
 
                 width_mask = x_width_
-                height_mask = y_height_                
-                
+                height_mask = y_height_
+
                 patch_mask_arr = mask[height_mask: height_mask + PATCH_SIZE, \
                                       width_mask: width_mask + PATCH_SIZE]
 
-                verboseprint("Numpy mask shape: ", patch_mask_arr.shape)
-                verboseprint("Numpy patch shape: ", patch_arr.shape)
+                # print("Numpy mask shape: ", patch_mask_arr.shape)
+                # print("Numpy patch shape: ", patch_arr.shape)
 
                 try:
                     bitwise_ = cv2.bitwise_and(patch_arr, patch_mask_arr)
-                
+
                 except Exception as err:
-                    print('Out of the boundary')
+                    # print('Out of the boundary')
                     pass
                     
 #                     f_ = ((patch_arr > PIXEL_TH) * 1)
@@ -339,36 +399,38 @@ def construct_bags(wsi_, wsi_rgb, contours, mask, level, mag_factor, PATCH_SIZE)
 #                     if np.mean(f_) <= (PIXEL_TH + 40):
 #                         patches.append(patch_arr)
 #                         patches_coords.append((x_width_, y_height_))
-#                         print(x_width_, y_height_)
-#                         print('Saved\n')
+#                print(x_width_, y_height_)
+#                print('Saved\n')
+
+                # else:
+                bitwise_grey = cv2.cvtColor(bitwise_, cv2.COLOR_RGB2GRAY)
+                white_pixel_cnt = cv2.countNonZero(bitwise_grey)
+
+                '''
+                    Patches whose valid area >= 25% of total area is considered
+                    valid and selected.
+                '''
+
+                if white_pixel_cnt >= ((PATCH_SIZE ** 2) * 0.50):
+                    
+                    if patch_arr.shape == (PATCH_SIZE, PATCH_SIZE, CHANNEL):
+                        patches.append(patch_arr)
+                        patches_coords.append((x_width_, y_height_))
+                        # print(x_width_, y_height_)
+                        # print('Saved\n')
 
                 else:
-                    bitwise_grey = cv2.cvtColor(bitwise_, cv2.COLOR_RGB2GRAY)
-                    white_pixel_cnt = cv2.countNonZero(bitwise_grey)
-
-                    '''
-                        Patches whose valid area >= 25% of total area is considered
-                        valid and selected.
-                    '''
-
-                    if white_pixel_cnt >= ((PATCH_SIZE ** 2) * 0.25):
-                        
-                        if patch_arr.shape == (PATCH_SIZE, PATCH_SIZE, CHANNEL):
-                            patches.append(patch_arr)
-                            patches_coords.append((x_width_, y_height_))
-                            verboseprint(x_width_, y_height_)
-                            verboseprint('Saved\n')
-
-                    else:
-                        verboseprint('Did not save\n')
+                    discardedPatches.append(patch_arr)
+                    whitePatches_coords.append((x_width_, y_height_))
+                    # print('Did not save\n')
 
     end = time.time()
-    verboseprint("Time spent on patch extraction: ",  (end - start))
+    # print("Time spent on patch extraction: ",  (end - start))
 
     # patches_ = [patch_[:,:,:3] for patch_ in patches] 
-    print("Total number of patches extracted:", len(patches))
+    # print("Total number of patches extracted:", len(patches))
     
-    return patches, patches_coords
+    return patches, patches_coords, discardedPatches, whitePatches_coords
 
 '''
     Save patches to disk.
@@ -391,17 +453,17 @@ def save_to_disk(patches, patches_coords, mask, slide_, level):
 
     if not os.path.exists(patch_array_dst):
         os.makedirs(patch_array_dst)
-        verboseprint('mkdir', patch_array_dst)
+        # print('mkdir', patch_array_dst)
 
     if not os.path.exists(prefix_dir):
         os.makedirs(prefix_dir)
-        verboseprint('mkdir', prefix_dir)
+        # print('mkdir', prefix_dir)
     
-    verboseprint('Path: ', array_file)
-    verboseprint('Path: ', coords_file)
-    verboseprint('Path: ', mask_file)
-    verboseprint('Number of patches: ', len(patches_coords))
-    verboseprint(patches_coords[:5])
+    # print('Path: ', array_file)
+    # print('Path: ', coords_file)
+    # print('Path: ', mask_file)
+    # print('Number of patches: ', len(patches_coords))
+    # print(patches_coords[:5])
     
     '''
         Save coordinates to the disk. Here we use pandas DataFrame to organize 
@@ -441,43 +503,49 @@ def save_to_disk(patches, patches_coords, mask, slide_, level):
 '''
     The whole pipeline of extracting patches.
 '''
-def extract_(slide_, level, mag_factor):
+def extract_(slide_, level, PATCH_SIZE, readType):
     '''
     Args:
         slide_: path to target slide.
         level: magnification level. 
-        mag_factor: pow(2, level).
-
+        mag_factor: pow(2, level). --> No longer used
+        readType : 'openslide' or 'largeImage'
     Returns: 
         To-do.
     '''
 
     start = time.time()
-    
-    wsi_, rgba_, shape_ = read_wsi(slide_, level)
+    if isinstance(slide_ , str):
+        if readType=='openslide':
+            rgba_, shape_ = read_wsi(slide_, level) # here level means the openslide level
+        elif readType=='largeImage':
+            rgba_, shape_ = read_tf_largeImage(slide_, level) # here level means magnification
+    elif isinstance(slide_ , PIL.Image.Image):
+        # wsi_ = ImageSlide(slide_) ; 
+        rgba_ = np.array(slide_)
     wsi_rgb_, wsi_gray_, wsi_hsv_ = construct_colored_wsi(rgba_)
 
-    print('Transformed shape: (height, width, channel)')
-    verboseprint("WSI HSV shape: ", wsi_hsv_.shape)
-    print("WSI RGB shape: ", wsi_rgb_.shape)
-    verboseprint("WSI GRAY shape: ", wsi_gray_.shape)
-    verboseprint('\n')
+    # print('Transformed shape: (height, width, channel)')
+    # print("WSI HSV shape: ", wsi_hsv_.shape)
+    # print("WSI RGB shape: ", wsi_rgb_.shape)
+    # print("WSI GRAY shape: ", wsi_gray_.shape)
+    # print('\n')
 
     del rgba_
     gc.collect()
 
     bounding_boxes, contour_coords, contours, mask \
     = segmentation_hsv(wsi_hsv_, wsi_rgb_)
-
+    return mask
     del wsi_hsv_
     gc.collect()
-
-    patches, patches_coords = construct_bags(wsi_, wsi_rgb_, contours, mask, \
-                                            level, mag_factor, PATCH_SIZE)
+    # caseName = slide_[:-4]
+    # patches, patches_coords, discardedPatches, whitePatches_coords = construct_bags(wsi_rgb_, contours, mask, \
+                                            # PATCH_SIZE)#, caseName)
 
     # save_to_disk(patches, patches_coords, mask, slide_, level)
     
     end = time.time()
-    print("Time spent on patch extraction: ",  (end - start))
+    # print("Time spent on patch extraction: ",  (end - start))
     
-    return patches, patches_coords, mask
+    # return patches, patches_coords, mask, discardedPatches, whitePatches_coords
