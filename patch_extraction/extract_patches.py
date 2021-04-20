@@ -116,8 +116,6 @@ def read_wsi(tif_file_path, level):
     time_s = time.time()
     
     try:
-        # import pdb
-        # pdb.set_trace()
         wsi_image = OpenSlide(tif_file_path)
         slide_w_, slide_h_ = wsi_image.level_dimensions[level]
         
@@ -180,8 +178,6 @@ def construct_colored_wsi(rgba_):
     r_, g_, b_, a_ = cv2.split(rgba_)
     
     wsi_rgb_ = cv2.merge((r_, g_, b_))
-    # wsi_rgb_ = rgba_
-
     wsi_gray_ = cv2.cvtColor(wsi_rgb_,cv2.COLOR_RGB2GRAY)
     wsi_hsv_ = cv2.cvtColor(wsi_rgb_, cv2.COLOR_RGB2HSV)
     
@@ -219,7 +215,6 @@ def get_contours(cont_img, rgb_image_shape):
         
     mask = np.zeros(rgb_image_shape, np.uint8)
     
-    # print('mask shape', mask.shape)
     cv2.drawContours(mask, contours, -1, \
                     (PIXEL_WHITE, PIXEL_WHITE, PIXEL_WHITE),thickness=-1)
     
@@ -267,12 +262,6 @@ def segmentation_hsv(wsi_hsv_, wsi_rgb_):
     # HSV image threshold
     thresh = cv2.inRange(wsi_hsv_, lower_, upper_)
     
-    # try:
-    #     # print("thresh shape:", thresh.shape)
-    # except:
-    #     # print("thresh shape:", thresh.size)
-    # else:
-    #     pass
     
     '''
         Closing
@@ -334,7 +323,6 @@ def construct_bags(wsi_rgb, contours, mask, PATCH_SIZE):#, caseName):
     for i, box_ in enumerate(contours_):
 
         box_ = cv2.boundingRect(np.squeeze(box_))
-        # print('region', i)
         
         '''
 
@@ -367,7 +355,6 @@ def construct_bags(wsi_rgb, contours, mask, PATCH_SIZE):#, caseName):
 
                 # Read again from WSI object wastes tooooo much time.
                 # patch_img = wsi_.read_region((x_width_, y_height_), level, (PATCH_SIZE, PATCH_SIZE))
-
                 '''
                     !!! Take care of difference in shapes
                     Here, the shape of wsi_rgb is (HEIGHT, WIDTH, CHANNEL)
